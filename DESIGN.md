@@ -14,8 +14,11 @@ system (`src/module.c`, `include/module.h`, `docs/modules.md`), a C backend,
 and a GC'd runtime. The module system is the consequential one: the earlier
 version of this document listed "no cross-file resolution" as a large chunk of
 work Emerald let us skip. That is no longer true, and it changes the
-architecture — see §2. The compiler-surgery list in §1 is unchanged and still
-blocks everything.
+architecture — see §2. Separately, `pme` — the package manager for Emerald —
+has entered design as a Python driver over the same `-I` seam; what that means
+for this server is in the final subsection of §2, and the implementation plan
+for pme itself is in the appendix. The compiler-surgery list in §1 is unchanged
+and still blocks everything.
 
 ---
 
@@ -217,8 +220,11 @@ it. That means:
   URI, including **clearing** files that went clean. That last part is the
   classic bug: an empty diagnostic list must still be published.
 - **Watch the workspace.** Register `workspace/didChangeWatchedFiles` for
-  `**/*.rald`. A dependency edited outside the editor, or a newly created
-  module that resolves a previously failing import, has to invalidate the cache.
+  `**/*.rald`, plus `emerald.toml` and `emerald.lock` — the manifest and
+  lockfile changing on disk changes the set of `-I` roots the analysis runs
+  with (final subsection of this section). A dependency edited outside the
+  editor, or a newly created module that resolves a previously failing import,
+  has to invalidate the cache.
 
 ### 2c. Names in the linked program are mangled
 
@@ -275,14 +281,37 @@ loader should degrade — report the import diagnostic, substitute an empty
 module for the unresolvable one, and keep linking — the same recovery
 philosophy as §1a, one level up.
 
-### Not needed: package management
+### Package management: pme resolves, the LSP consumes
 
-Resolution is filesystem-only, driven by `-I` roots. There is no lockfile, no
-registry, no version solving. `main.c`'s header explicitly frames the CLI as
-"the whole contract between emeraldc and any driver (such as pme) that resolves
-packages on its behalf" — so if a package manager arrives, the server keeps
-talking to the same `-I` interface and inherits nothing new. Preserve that
-boundary.
+`pme` — the package manager for Emerald — is in design as a Python driver
+around `emeraldc` (implementation plan in the appendix). The compiler seam is
+unchanged: `emeraldc` still takes ordered `-I` roots, and the server inherits
+nothing new from the compiler. What changed is that a project with dependencies
+only resolves imports when each dependency's `src/` is on the path — and that
+information lives in pme's outputs, not in the workspace.
+
+**Never reimplement resolution in the LSP.** No version solving, no registry
+reads, no fetches. pme owns resolution; the LSP consumes its results — one-way,
+exactly like the `-I` seam itself. Concretely: read `emerald.lock` (generated,
+committed, plain TOML — trivial to parse) and apply pme's frozen `-I` rule.
+Each locked package contributes one `-I`: its `src/` directory under
+`~/.emerald/store/`, dependencies before dependents, ties broken by name. The
+project's own roots (the importing file's directory, the nearest `src/`) stay
+the compiler's business via `find_src_root` — the LSP only supplies package
+roots. Store packages are immutable and never open in the editor, so the §2a
+overlay only ever covers workspace buffers; `emerald.lock`'s content hashes are
+what make that trust safe.
+
+Two consequences for the server:
+
+- **The manifest and lockfile are analysis inputs.** A `pme add` or lockfile
+  update changes the `-I` set, so `emerald.toml` and `emerald.lock` join the
+  file-watch list (§2b) and their change invalidates the analysis cache.
+- **The rule is pme's; copy it, don't re-derive it.** pme's milestone 3
+  (`pme build` with path dependencies, no network) is where the rule is
+  exercised end to end. The LSP side is a couple of hundred lines,
+  golden-testable against a fake store before pme ships (§8). Keep the rule
+  documented in one place in pme so the LSP's copy is verifiable against it.
 
 ---
 
@@ -506,6 +535,11 @@ siblings, an optional `flags` file, `bad_*` prefixes for expected failures.
 - **Overlay tests**: a case where the on-disk text and the overlay text
   disagree, asserting the analysis reflects the overlay. This is the one bug
   class that no other test catches and that users will hit constantly.
+- **Lockfile-driven roots**: a fixture workspace with a fake
+  `~/.emerald/store` and an `emerald.lock`, asserting that imports of locked
+  packages resolve as if their `-I` roots had been passed, and that editing
+  the lockfile invalidates the cache. This is the test that keeps the LSP
+  honest about whose resolution it is consuming — pme's, not its own.
 - **Session tests**: pipe a scripted JSON-RPC conversation into the server
   and golden-diff the responses. `pygls` ships test helpers for driving a
   server in-process, which is easier than framing messages by hand. Include a
@@ -525,6 +559,7 @@ siblings, an optional `flags` file, `bad_*` prefixes for expected failures.
 
 ```
 end positions in AST  →  parser error recovery  →  loader overlay hook
+      →  lockfile-driven -I roots (final subsection of §2)
       →  --lsp-index JSON (multi-file)  →  pygls skeleton + sync + diagnostics
       →  semantic tokens  →  type side table  →  hover  →  symbol table
       →  goto-def (cross-file)  →  completion (incl. imports)
@@ -532,9 +567,236 @@ end positions in AST  →  parser error recovery  →  loader overlay hook
       →  code actions
 ```
 
-The first three steps are unglamorous compiler surgery with nothing to demo,
-and it is tempting to skip ahead to the JSON-RPC loop where progress is
+The first three steps are unglamorous compiler surgery with nothing to demo;
+the fourth — lockfile-driven `-I` roots — is invisible until a package exists
+to resolve. It is tempting to skip ahead to the JSON-RPC loop where progress is
 visible. Don't. Every feature past diagnostics is built on source ranges, on
-parsing broken text, and — now that modules exist — on analyzing the buffers
-the user actually has open rather than the files on disk. Retrofitting any of
-the three later means touching every handler a second time.
+parsing broken text, and — now that modules and packages exist — on analyzing
+the buffers the user actually has open rather than the files on disk.
+Retrofitting any of the three surgical steps later means touching every handler
+a second time.
+
+---
+
+## Appendix: pme in Python — implementation plan
+
+The working plan for `pme` (spec: `evangelion-research/pme`'s `DESIGN.md`),
+expanded from that spec's §10–§11 into concrete, ordered steps. The pme spec
+is authoritative — this is the *doing* order. It lives here because the LSP
+and pme share the `-I` seam (final subsection of §2) and the LSP integration
+is designed alongside pme milestone 3. Nothing below is code: each step names
+its module, its invariants, and the gate that says it's done.
+
+Per the pme spec: **Python 3.11+**, I/O-bound not CPU-bound, distributed on
+PyPI as `emerald-pme` (`pipx install pme` / `uv tool install pme`). Milestone 0
+(the module system, `emerald@1f683be`) is done; **milestone 1 — manifest +
+lockfile + semver — is the current front of work**.
+
+### The skeleton (pme spec §10.1)
+
+| module | responsibility |
+|---|---|
+| `pme/cli.py` | argparse dispatch, exit codes, `--json` / `-q` plumbing |
+| `pme/manifest.py` | `emerald.toml` read/validate (tomllib) and comment-preserving write (tomlkit) |
+| `pme/lockfile.py` | `emerald.lock` read/write, deterministic ordering |
+| `pme/semver.py` | parse/compare/constrain, hand-rolled (~150 lines) |
+| `pme/resolve.py` | MVS |
+| `pme/registry.py` | index fetch, tarball download, publish (httpx) |
+| `pme/store.py` | content-addressed cache, atomic extract, verify |
+| `pme/build.py` | `-I` computation, `emeraldc` invocation, diagnostic passthrough |
+| `pme/diagnostics.py` | the §8 error shapes, human + JSON renderers |
+| `pme/errors.py` | `PmeError` hierarchy → exit codes |
+
+Dependencies: `tomllib` (stdlib) to read, `tomlkit` to write, `httpx` for
+HTTP, `pytest` + `pytest-httpx` for tests. **No `packaging`** — Emerald semver
+is stricter than PEP 440.
+
+Cross-cutting rules, in force from step 1:
+
+- **Atomicity.** Every filesystem mutation writes to a temp path in the same
+  directory and `os.replace`s into place; a `^C` mid-extract leaves nothing
+  behind.
+- **Locking.** `~/.emerald/.lock`, flock, around every store write — two
+  concurrent `pme build`s must not corrupt each other.
+- **Verify before use, always.** Hash on extract and on demand; never trust a
+  store path just because it exists.
+- **Offline builds.** `pme build` makes no network calls when the lock is
+  satisfied by the store.
+- **No `shell=True`.** `emeraldc` is invoked with an argv list.
+- **Error shapes from day one.** pme's kinds (`manifest`, `resolve`,
+  `registry`, `io`) are disjoint from the compiler's (`syntax`, `type`,
+  `internal`), so a merged `--json` stream is attributable to one producer per
+  object.
+
+### Phase 1 — foundations (milestone 1: manifest + lockfile + semver)
+
+**Step 1 — repo scaffold.** `pyproject.toml` (hatchling;
+`requires-python = ">=3.11"`; console script `pme = pme.cli:main`),
+`src/pme/` package, `tests/`. Build the CLI skeleton first: argparse
+subcommands, `--json` / `-q` accepted by every command from day one, and the
+exit-code contract (0 ok, 1 user/build error, 2 bad usage, 3
+network/registry). `main()` catches the `PmeError` base class and renders
+through `diagnostics.py` (stub renderers for now).
+*Gate:* `pme --help` and `pme badcmd` behave; bad usage exits 2; `--json`
+accepted everywhere.
+
+**Step 2 — `semver.py`.** Parse `MAJOR.MINOR.PATCH` with optional
+`-prerelease`; compare; evaluate a minimum-version constraint — MVS only ever
+needs "satisfies this minimum". Prerelease rule (pme spec open question 4):
+never selected automatically, only by exact pin. Property tests: parse
+round-trip, comparison transitivity, constraint boundaries (equal,
+one-patch-up, major bump, prerelease ordering).
+*Gate:* pytest green; module stays ~150 lines.
+
+**Step 3 — `manifest.py` (read/validate).** tomllib parse plus the spec's
+validation rules: name `[a-z][a-z0-9_]*` 2–64 chars; version strict semver;
+exactly one of `[lib]` or `[[bin]]` (both allowed); license and authors
+present; `emerald` compiler constraint parsed; `path` deps detected and
+flagged — legal locally, fatal at publish. Violations become `E_*` manifest
+diagnostics in the §8 shape.
+*Gate:* golden tests for good and bad manifests; every message names the
+offending field.
+
+**Step 4 — `manifest.py` (write) + `lockfile.py`.** The tomlkit write path —
+what `pme add` uses, and it must preserve the user's comments and formatting,
+so never dump-and-replace. Lockfile read/write: TOML `version = 1`,
+`[[package]]` entries sorted deterministically by name (readable diffs), each
+with `version`, `checksum`, `deps`. Reject unknown fields — a lockfile is
+generated and never hand-edited.
+*Gate:* manifest round-trip preserves comments; lockfile goldens; an
+unknown-field lockfile fails loudly.
+
+**Step 5 — `pme init`.** Scaffold `emerald.toml`, `src/main.rald`,
+`.gitignore`. Reuse the step-3 validator on the scaffold to prove it
+round-trips.
+*Gate:* `pme init` in a temp dir yields a manifest that validates and a
+`src/main.rald` the compiler accepts.
+
+### Phase 2 — resolution (milestone 2: MVS)
+
+**Step 6 — `resolve.py`.** A **pure function**: root manifest + an index → a
+resolution or a set of resolve errors. Define the index as a narrow interface
+first (fetch the manifest for `(name, version)`), implemented with an
+in-memory fake before anything touches the network. MVS fixed point: seed with
+the root's direct deps at their minimums; repeatedly, for each selected
+package, raise each dependency to the max of what's selected and what it
+requires; stop when nothing moves. **One version per package, no multi-major
+support, ever** — mangling is keyed on the dotted module path only, so two
+majors of one package would collide in one translation unit; diagnose the
+conflict instead.
+The four failure modes, all with good messages: `E_RESOLVE_NOT_FOUND`,
+`E_RESOLVE_NO_VERSION`, `E_RESOLVE_MAJOR_CONFLICT` (must print **both**
+dependency paths — this is what `pme why` renders), and `E_RESOLVE_COMPILER`
+(guarded: only fires once `emeraldc --version` exists upstream — pme spec
+open question 2; keep the error type and the check behind a flag until then).
+*Gate:* resolver tests against the fake index — diamond graph, major conflict
+with both paths printed, missing package, no satisfying version, prerelease
+pin-by-exact-version only.
+
+### Phase 3 — store + build (milestone 3: offline, path deps only)
+
+**Step 7 — `store.py`.** Layout `~/.emerald/store/<name>-<ver>-<hash>/`,
+extracted once and immutable — content-addressing means two projects share one
+copy and corruption is detectable. Atomic extract (temp dir in the same
+filesystem, then `os.replace`), flock around mutations, sha256 on extract.
+Never vendor into the project directory.
+*Gate:* a kill-mid-extract test leaves no partial entry; two concurrent
+extracts of one package both succeed and share one entry.
+
+**Step 8 — `build.py`.** The heart of pme and the seam the whole design
+freezes: compute the ordered `-I` roots — each locked package's `src/`
+directory (not its store root), dependencies before dependents, ties broken by
+name — then exec `emeraldc -I <root> … -o target/<bin> <entry>`. argv list,
+never a shell string. Pass `--json` through when asked and render pme's own
+errors into the same stream shape. **No build scripts, ever**: installing a
+package must never execute its code — that property is load-bearing.
+*Gate:* a multi-package project with `path` deps builds fully offline; a
+broken dependency produces one merged JSON error stream.
+
+**Step 9 — `pme run` / `pme tree` / `pme why` (local-only).** Run = build
+then exec the binary. Tree renders the resolved graph with selected versions;
+why prints every root→package path, reusing the conflict-path machinery from
+step 6.
+*Gate:* correct output on the path-dep sample project — milestone 3 is the
+first genuinely useful build and needs no registry at all.
+
+### Phase 4 — registry reads (milestone 4)
+
+**Step 10 — `registry.py` (index).** Fetch the per-package NDJSON index at its
+sharded path (`index/st/ri/strings.json`), one line per published version,
+append-only. Append-only means aggressive client caching (conditional GET /
+TTL); `yanked` is the one in-place mutation — a yanked version stays
+downloadable for existing lockfiles but is never newly selected. httpx with
+real timeouts and retries; network failure → exit 3.
+*Gate:* pytest-httpx tests with recorded fixtures; replayable offline.
+
+**Step 11 — download → store.** Fetch the tarball from the URL in the index
+line, verify the sha256 from the same line, extract atomically into the
+store. A checksum mismatch is a hard error and never a re-download.
+*Gate:* install a fixture package; a corrupted fixture fails verification
+with the hash printed.
+
+**Step 12 — `pme add` / `remove` / `install` / `--locked`.** `add` resolves
+the latest (or the given version), edits the manifest through the tomlkit
+path from step 4 (comments survive), rewrites the lock. `install` re-resolves
+only when the manifest changed, then rewrites the lock; `--locked` refuses to
+touch the lock and exits non-zero on drift. `build` consumes the lock as-is
+and **fails** on a stale lock rather than silently re-resolving —
+reproducibility is the point of the lockfile.
+*Gate:* the full happy path on a fixture registry (add → install → build),
+plus the `--locked` drift cases.
+
+### Phase 5 — registry writes (milestone 5)
+
+**Step 13 — reproducible tarball builder.** Package the git-tracked files
+only, honoring `.pmeignore`; normalized entries (sorted, fixed
+mtime/uid/gid/mode) so the same tree hashes identically every time; sha256 the
+result. Reject any tree containing both `a/b.rald` and `a.b.rald` — that
+would be `E_IMPORT_AMBIGUOUS` for every consumer (pme spec §0.2).
+*Gate:* building the same tree twice yields an identical sha256.
+
+**Step 14 — `pme login` / `publish` / `yank`.** `login` writes
+`~/.emerald/credentials.toml`, mode 0600. `publish` runs the spec's flow in
+order: validate the manifest (no path deps, `[lib]` present), reject the
+both-spellings tree, verify the version isn't already published — immutability
+is absolute, no overwrites ever — build the tarball, dry-run compile in a temp
+dir against its own deps, upload, append the index line. `yank` marks a
+version unselectable without deleting it.
+*Gate:* publish a fixture package to a **local** git-backed index; yank it;
+fresh resolution no longer selects it but an existing lockfile still installs
+it.
+
+**Step 15 — Stage-1 registry live.** Stand up the static index: a git repo
+served over HTTPS (e.g. `pme-index` on GitHub Pages), tarballs as release
+assets, publishes as PRs for untrusted authors. Publish the first real package
+and install it from a clean machine. **Decide the stdlib boundary (pme spec
+open question 1) before this step** — if stdlib ships as packages, every build
+carries stdlib entries in its lockfile. The client protocol is only three
+operations, so a Stage-2 service later is a `base_url` swap.
+*Gate:* fresh-machine `pme install` of the published package, end to end, with
+no local state.
+
+### Phase 6 — polish (milestone 6)
+
+**Step 16 — the rest of the CLI.** `pme test` (compile and run every
+`tests/*.rald`, dev-deps on the `-I` path, pass = exit 0), `pme update` (bump
+recorded minimums to the latest compatible, then re-resolve), `pme verify`
+(re-hash every store entry against the lock), `pme clean` (remove `target/`;
+`--store` prunes unreferenced entries).
+
+**Step 17 — `--json` audit, docs, and the LSP handoff.** Audit that every
+command emits the §8 shape; write the README. Then the emerald-lsp
+integration (final subsection of §2): the LSP reads `emerald.lock`, computes
+the same `-I` roots, never re-resolves. Keep the `-I` computation rule visible
+and documented in one place in pme so the LSP's copy is trivially verifiable
+against it.
+
+### Ordering notes
+
+- Steps 1–5 are the current front of work (pme milestone 1).
+- Step 8 is where the frozen compiler seam is actually exercised — the most
+  important thing to get right, because everything after it is plumbing
+  around the same exec.
+- The LSP integration (step 17 / final subsection of §2) is worth
+  *designing* alongside step 8 even though it lands later — pme spec open
+  question 3.
