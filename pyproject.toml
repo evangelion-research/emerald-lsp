@@ -12,11 +12,18 @@ dependencies = [
 ]
 
 [project.scripts]
-emerald-lsp = "emerald_lsp.cli:main"
+emerald-lsp = "emlsp.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["emerald_lsp"]
+packages = ["emlsp"]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

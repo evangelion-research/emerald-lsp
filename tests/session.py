@@ -1,6 +1,6 @@
 """A minimal LSP client: enough framing to drive the server in a test.
 
-`pygls` ships in-process helpers, but running the real `python -m emerald_lsp`
+`pygls` ships in-process helpers, but running the real `python -m emlsp`
 over pipes is what actually proves the packaging, the stdio transport, and the
 handler signatures at once -- the three things that break silently.
 """
@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 class Session:
     def __init__(self, root: Path | None = None) -> None:
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "emerald_lsp"],
+            [sys.executable, "-m", "emlsp"],
             cwd=str(ROOT),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
