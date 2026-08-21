@@ -1,7 +1,6 @@
 # Emerald LSP
 
-A language server for the Emerald programming language. This repository is
-currently **design notes, not code** — the working document is
+A language server for the Emerald programming language. The working document is
 [`DESIGN.md`](DESIGN.md), which lays out what it takes to get from `emeraldc`
 (7,000+ lines of C11: `lexer → parser → module link → check → codegen`, plus a
 mark-and-sweep runtime) to a working language server.
@@ -13,16 +12,126 @@ side-table, a symbol table — do not exist yet and all live in the compiler.
 
 ## Status
 
-- **Phase:** design. The compiler-surgery list in `DESIGN.md` §1 (error
-  recovery, end positions, allocation, structured output) blocks everything.
-- **Planned shape:** Python + `pygls` for the protocol layer, C for analysis.
-  `emeraldc` is extended into a JSON query backend and the server shells out to
-  it per document version, with fresh-process analysis that sidesteps the
-  compiler's memory model entirely.
-- **Modules changed the architecture.** Emerald grew a module system
-  (`src/module.c` in the compiler), which makes analysis per-program rather
-  than per-file and adds a loader overlay for unsaved editor buffers. See
-  `DESIGN.md` §2.
+**v0.1 — a working server, running ahead of the compiler surgery.**
+`emerald_lsp/` is Python + `pygls`, as designed. It answers the whole
+protocol lifecycle today, in two layers with very different reach:
+
+| Feature | How it works | Limit |
+|---|---|---|
+| Diagnostics | `emeraldc --check --json` per document version, debounced | one syntax error at a time, until the parser recovers (§1a); ranges are one token wide, until the AST carries end positions (§1b) |
+| Semantic tokens | this package's own Emerald lexer | purely lexical, and deliberately so — it survives a broken import graph |
+| Document symbols, folding | a token-level outline | no types |
+| Hover | declaration text, or the builtin/keyword table | shows the *declaration*, not an inferred type (§4b) |
+| Goto-definition | the outline, plus `import` resolution | cross-file for imported names; scope-approximate for locals (§4c) |
+| Completion | keywords, builtins, in-scope names; module paths after `import`; a module's exports after `from m import` and after `m.` | field completion on a **value** stays silent — it needs the checker's type for the receiver |
+| References, highlights | name matches | this file only |
+| Workspace symbols | top-level names across `*.rald` | top-level only |
+
+What is *not* here, and why: inlay hints, rename, and code actions all need the
+type side table and symbol table of `DESIGN.md` §4, and formatting needs a
+pretty-printer that does not exist. The compiler-surgery list in §1 — error
+recovery, end positions, allocation, structured output — still blocks the good
+version of every row above. This server is built so that landing it is a
+rewrite of the analysis layer only: `emerald_lsp/compiler.py` grows a
+`--lsp-index` call, and the handlers stop reading `emerald_lsp/outline.py`.
+
+## Install
+
+```
+uv tool install emerald-lsp      # or: pipx install emerald-lsp
+emerald-lsp --version
+```
+
+From a checkout:
+
+```
+uv sync
+uv run emerald-lsp --help
+```
+
+The server needs `emeraldc` on `PATH` for diagnostics — set
+`emerald.compilerPath` or `$EMERALDC` if it lives elsewhere. Without it,
+every syntax-only feature above still works; the server says so once and
+carries on.
+
+To see the exact query the server makes per keystroke:
+
+```
+emerald-lsp --check path/to/file.rald
+```
+
+## Editor setup
+
+**Neovim** (0.11+):
+
+```lua
+vim.filetype.add({ extension = { rald = "emerald" } })
+vim.lsp.config.emerald = {
+  cmd = { "emerald-lsp" },
+  filetypes = { "emerald" },
+  root_markers = { "emerald.toml", "src", ".git" },
+  settings = { emerald = { includePaths = {} } },
+}
+vim.lsp.enable("emerald")
+```
+
+**Helix** (`languages.toml`):
+
+```toml
+[language-server.emerald-lsp]
+command = "emerald-lsp"
+
+[[language]]
+name = "emerald"
+file-types = ["rald"]
+comment-token = "#"
+language-servers = ["emerald-lsp"]
+indent = { tab-width = 4, unit = "    " }
+```
+
+**Zed / VS Code**: point the client at the `emerald-lsp` binary over stdio.
+`--tcp --port N` is available for debugging a client that cannot spawn a
+process.
+
+### Configuration
+
+All keys live under `emerald` in `initializationOptions` or
+`workspace/didChangeConfiguration`:
+
+| key | default | meaning |
+|---|---|---|
+| `compilerPath` | `emeraldc` on `PATH` | the checker to run |
+| `includePaths` | `[]` | extra `-I` roots, before the lockfile's |
+| `diagnostics.enabled` | `true` | run the checker at all |
+| `proof` | `false` | pass `--proof` (promotes warnings to errors) |
+| `debounceMs` | `250` | idle time before a check |
+| `timeoutSeconds` | `10` | give up on a wedged compiler |
+
+## Development
+
+```
+uv run python -m unittest discover -s tests -t .
+```
+
+The suite covers the lexer, the outline, position encoding, the diagnostic
+mapping, the lockfile `-I` rule, and the features — plus two kinds of test the
+design calls out: a truncation fuzz over every prefix of several samples, and
+end-to-end sessions that drive the real server process over stdio with a stub
+compiler.
+
+Layout:
+
+```
+emerald_lsp/lexer.py       an Emerald tokenizer (mirrors src/lexer.c)
+emerald_lsp/outline.py     token-level symbols, scopes, imports
+emerald_lsp/modules.py     import resolution (mirrors docs/modules.md)
+emerald_lsp/compiler.py    the emeraldc subprocess seam, and pme's -I rule
+emerald_lsp/diagnostics.py compiler JSON -> LSP diagnostics
+emerald_lsp/semantic.py    semantic tokens
+emerald_lsp/features.py    hover, definition, completion, symbols
+emerald_lsp/positions.py   byte<->char columns, path<->URI
+emerald_lsp/server.py      pygls handlers, debounce, cache
+```
 
 ## pme — the package manager
 
