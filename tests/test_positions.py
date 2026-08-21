@@ -1,11 +1,6 @@
 import unittest
 
-from emerald_lsp.positions import (
-    byte_col_to_char_col,
-    char_col_to_byte_col,
-    path_to_uri,
-    uri_to_path,
-)
+from emerald_lsp.positions import byte_col_to_char_col, path_to_uri, uri_to_path
 
 
 class TestPositions(unittest.TestCase):
@@ -24,13 +19,11 @@ class TestPositions(unittest.TestCase):
         byte_col = line.encode().index(b"+") + 1
         self.assertEqual(byte_col_to_char_col(line, byte_col), line.index("+"))
 
-    def test_round_trip(self):
+    def test_every_character_boundary_maps_back(self):
         line = "é🙂 abc"
         for char_col in range(len(line)):
-            self.assertEqual(
-                byte_col_to_char_col(line, char_col_to_byte_col(line, char_col)),
-                char_col,
-            )
+            byte_col = len(line[:char_col].encode("utf-8")) + 1
+            self.assertEqual(byte_col_to_char_col(line, byte_col), char_col)
 
     def test_past_the_end_clamps(self):
         self.assertEqual(byte_col_to_char_col("ab", 99), 2)

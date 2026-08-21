@@ -166,9 +166,9 @@ class TestCheck(unittest.TestCase):
         )
 
     def test_the_overlay_sits_beside_the_real_file_so_imports_resolve(self):
-        overlay = compiler._TempOverlay(str(self.file), "x")
-        with overlay as temp:
-            self.assertEqual(temp.parent, self.file.parent)
+        temp = compiler._overlay_path(str(self.file))
+        self.assertEqual(temp.parent, self.file.parent)
+        self.assertTrue(temp.name.startswith("."))
 
     def test_include_paths_are_passed_as_I_flags(self):
         settings = compiler.Settings(compiler_path=self.binary, include_paths=["/lib"])

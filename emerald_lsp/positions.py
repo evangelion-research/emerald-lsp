@@ -10,7 +10,7 @@ Two coordinate systems meet here and nowhere else in this package:
 Internally the server works in 0-based lines and 0-based UTF-32 character
 columns -- pygls' own convention -- so the UTF-16 step is applied once, by
 `emerald_lsp.server`, through the document's own position codec. Everything
-here is the byte/char and path/URI half.
+here is the byte-to-char and path/URI half.
 """
 
 from __future__ import annotations
@@ -50,10 +50,6 @@ def canonical(path: str) -> str:
         return os.path.abspath(path)
 
 
-def same_file(a: str | None, b: str | None) -> bool:
-    return a is not None and b is not None and canonical(a) == canonical(b)
-
-
 def byte_col_to_char_col(line_text: str, byte_col: int) -> int:
     """1-based byte column (compiler) -> 0-based character column.
 
@@ -67,31 +63,27 @@ def byte_col_to_char_col(line_text: str, byte_col: int) -> int:
     return len(encoded[:byte_offset].decode("utf-8", errors="ignore"))
 
 
-def char_col_to_byte_col(line_text: str, char_col: int) -> int:
-    """0-based character column -> 1-based byte column, for `file:line:col`
-    queries handed back to the compiler."""
-    return len(line_text[:char_col].encode("utf-8")) + 1
-
-
 def line_text(lines: list[str], line: int) -> str:
     return lines[line] if 0 <= line < len(lines) else ""
-
-
-def position(line: int, character: int) -> types.Position:
-    return types.Position(line=line, character=character)
 
 
 def range_of(
     start_line: int, start_char: int, end_line: int, end_char: int
 ) -> types.Range:
     return types.Range(
-        start=position(start_line, start_char), end=position(end_line, end_char)
+        start=types.Position(line=start_line, character=start_char),
+        end=types.Position(line=end_line, character=end_char),
     )
 
 
+def span(first, last) -> types.Range:
+    """From one `emerald_lsp.lexer.Token`'s start to another's end."""
+    return range_of(first.line, first.col, last.end_line, last.end_col)
+
+
 def token_range(token) -> types.Range:
-    """The range covered by an `emerald_lsp.lexer.Token`."""
-    return range_of(token.line, token.col, token.end_line, token.end_col)
+    """The range covered by a single token."""
+    return span(token, token)
 
 
 def contains(rng: types.Range, pos: types.Position) -> bool:

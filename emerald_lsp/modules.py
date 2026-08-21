@@ -66,14 +66,10 @@ def roots_for(
     std = stdlib_root(compiler)
     if std is not None:
         roots.append(std)
-    seen: set[str] = set()
-    ordered = []
+    by_key: dict[str, Path] = {}
     for root in roots:
-        key = str(root.resolve()) if root.exists() else str(root)
-        if key not in seen:
-            seen.add(key)
-            ordered.append(root)
-    return ordered
+        by_key.setdefault(str(root.resolve()) if root.exists() else str(root), root)
+    return list(by_key.values())
 
 
 def resolve(
@@ -101,14 +97,13 @@ def module_candidates(
     Only one directory level is descended: enough for `text.strings`, and it
     keeps a large workspace from turning completion into a filesystem walk.
     """
-    names: list[str] = []
-    seen: set[str] = set()
-    for root in roots_for(importer, include_paths, compiler):
-        for path in _list_modules(root):
-            if path not in seen:
-                seen.add(path)
-                names.append(path)
-    return sorted(names)
+    return sorted(
+        {
+            name
+            for root in roots_for(importer, include_paths, compiler)
+            for name in _list_modules(root)
+        }
+    )
 
 
 def _list_modules(root: Path, depth: int = 2) -> list[str]:

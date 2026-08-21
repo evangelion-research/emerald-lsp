@@ -31,7 +31,6 @@ log = logging.getLogger(__name__)
 
 SERVER_NAME = "emerald-lsp"
 SERVER_VERSION = "0.1.0"
-LANGUAGE_ID = "emerald"
 # how many .rald files a workspace-symbol query is willing to read
 WORKSPACE_SCAN_LIMIT = 2000
 
@@ -149,6 +148,17 @@ class EmeraldLanguageServer(LanguageServer):
             )
         self._published = set(grouped)
 
+    def forget(self, uri: str) -> None:
+        """Drop a closed document: cancel its pending run and clear the
+        diagnostics the client is still showing for it."""
+        task = self._pending.pop(uri, None)
+        if task is not None:
+            task.cancel()
+        self.text_document_publish_diagnostics(
+            types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
+        )
+        self._published.discard(uri)
+
     # -- encoding boundary ------------------------------------------------
     def client_range(self, uri: str, rng: types.Range) -> types.Range:
         """UTF-32 character columns -> whatever the client negotiated."""
@@ -225,30 +235,20 @@ def did_change_watched_files(params: types.DidChangeWatchedFilesParams) -> None:
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_OPEN)
-def did_open(params: types.DidOpenTextDocumentParams) -> None:
-    server.schedule_check(params.text_document.uri)
-
-
 @server.feature(types.TEXT_DOCUMENT_DID_CHANGE)
-def did_change(params: types.DidChangeTextDocumentParams) -> None:
-    server.schedule_check(params.text_document.uri)
-
-
 @server.feature(types.TEXT_DOCUMENT_DID_SAVE)
-def did_save(params: types.DidSaveTextDocumentParams) -> None:
+def did_touch_document(params: types.DidOpenTextDocumentParams) -> None:
+    """Open, edit, and save all mean the same thing here: re-check the buffer.
+
+    The debounce in `schedule_check` is what keeps a burst of edits from
+    turning into a burst of subprocesses.
+    """
     server.schedule_check(params.text_document.uri)
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_CLOSE)
 def did_close(params: types.DidCloseTextDocumentParams) -> None:
-    uri = params.text_document.uri
-    task = server._pending.pop(uri, None)
-    if task is not None:
-        task.cancel()
-    server.text_document_publish_diagnostics(
-        types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
-    )
-    server._published.discard(uri)
+    server.forget(params.text_document.uri)
 
 
 # -- syntax-only features ------------------------------------------------

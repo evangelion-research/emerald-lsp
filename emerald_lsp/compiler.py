@@ -13,7 +13,7 @@ absence shapes this file:
   before checking, which keeps `import` resolution (the importing file's
   directory is search root #1, `docs/modules.md`) behaving as it does on disk.
   When the overlay hook of DESIGN.md 2a lands, `Overlay` becomes a JSON map on
-  the command line and `_TempOverlay` disappears.
+  the command line and the temp file disappears.
 * **No parser error recovery.** The parser exits on the first syntax error
   (DESIGN.md 1a), so a broken buffer yields exactly one diagnostic and no type
   errors. That is the compiler's behaviour, faithfully reported, not a bug
@@ -25,20 +25,16 @@ read `emerald.lock` and turn it into `-I` flags; we never solve versions.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
-import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_BINARY = "emeraldc"
 LOCKFILE = "emerald.lock"
-MANIFEST = "emerald.toml"
-# `emerald.lock` and `emerald.toml` are analysis inputs: a change to either
-# changes the `-I` set (DESIGN.md, "pme resolves, the LSP consumes").
-WATCHED_FILES = (LOCKFILE, MANIFEST)
 
 
 class CompilerNotFound(Exception):
@@ -190,39 +186,22 @@ def include_paths_for(path: str, settings: Settings) -> list[str]:
     lock = find_lockfile(path)
     if lock is not None:
         roots.extend(lock_include_paths(lock))
-    seen: set[str] = set()
-    unique = []
-    for root in roots:
-        resolved = os.path.abspath(os.path.expanduser(root))
-        if resolved not in seen:
-            seen.add(resolved)
-            unique.append(resolved)
-    return unique
+    return list(
+        dict.fromkeys(os.path.abspath(os.path.expanduser(r)) for r in roots)
+    )
 
 
-class _TempOverlay:
-    """A dirty buffer, written beside the real file so imports still resolve.
+def _overlay_path(path: str) -> Path:
+    """Where a dirty buffer is staged: beside the real file, so imports still
+    resolve.
 
     A sibling temp file is not free -- it is briefly visible to anything
     watching the directory -- but it is the only way to analyze unsaved text
     until the loader takes an overlay map (DESIGN.md 2a). The dot prefix keeps
     it out of `*.rald` globs.
     """
-
-    def __init__(self, path: str, source: str) -> None:
-        self.real = Path(path)
-        self.temp = self.real.with_name(f".{self.real.stem}.emlsp-{os.getpid()}.rald")
-        self.source = source
-
-    def __enter__(self) -> Path:
-        self.temp.write_text(self.source, encoding="utf-8")
-        return self.temp
-
-    def __exit__(self, *exc: object) -> None:
-        try:
-            self.temp.unlink()
-        except OSError:  # pragma: no cover -- best effort cleanup
-            pass
+    real = Path(path)
+    return real.with_name(f".{real.stem}.emlsp-{os.getpid()}.rald")
 
 
 def check(
@@ -263,16 +242,17 @@ def check(
 
     if source is None:
         return run(Path(path))
-    overlay = _TempOverlay(path, source)
-    with overlay as temp:
+    temp = _overlay_path(path)
+    try:
+        temp.write_text(source, encoding="utf-8")
         result = run(temp)
-    _remap(result.diagnostics, str(overlay.temp), path)
+    finally:
+        temp.unlink(missing_ok=True)
+    _remap(result.diagnostics, temp.name, path)
     return result
 
 
 def _parse_output(stdout: str, stderr: str, code: int) -> CheckResult:
-    import json
-
     text = stdout.strip()
     if not text:
         # a clean file emits `[]`; genuinely empty stdout means it crashed or
@@ -289,9 +269,8 @@ def _parse_output(stdout: str, stderr: str, code: int) -> CheckResult:
     return CheckResult([d for d in data if isinstance(d, dict)], True)
 
 
-def _remap(diagnostics: list[dict], temp_path: str, real_path: str) -> None:
+def _remap(diagnostics: list[dict], temp_name: str, real_path: str) -> None:
     """Point diagnostics at the buffer's real file, not the temp copy."""
-    temp_name = os.path.basename(temp_path)
     for diag in diagnostics:
         file = diag.get("file")
         if isinstance(file, str) and os.path.basename(file) == temp_name:
@@ -307,9 +286,3 @@ def probe(binary: str) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return (proc.stdout or proc.stderr).strip() or None
-
-
-if __name__ == "__main__":  # a pasteable query, exactly like the design asks
-    target = sys.argv[1]
-    result = check(target, None, Settings())
-    print(result.detail or "", *result.diagnostics, sep="\n")

@@ -25,15 +25,6 @@ KEYWORDS = frozenset(
     """.split()
 )
 
-# Not lexer keywords -- the parser recognises these as type atoms
-# (grammar.md, "Type Expressions"). Highlighted and completed as types.
-TYPE_ATOMS = frozenset(
-    "int float str bool None any never list seq Tensor Fin Eq".split()
-)
-
-# Literal-ish primaries that are neither keyword nor type (grammar.md, primary).
-CONSTANTS = frozenset("True False None refl".split())
-
 # Longest match first; from lexer.c's punctuation switch and TokKind.
 OPERATORS = (
     "//=", "**=",
@@ -42,8 +33,6 @@ OPERATORS = (
     "{", "}", "(", ")", "[", "]", ",", ".", ":", ";", "=",
     "|", "&", "^", "+", "-", "*", "/", "%", "<", ">", "?",
 )
-
-OPEN_TO_CLOSE = {"{": "}", "(": ")", "[": "]"}
 
 
 @dataclass(slots=True, frozen=True)
@@ -57,10 +46,6 @@ class Token:
     end_line: int
     end_col: int
     offset: int  # 0-based character offset into the source
-
-    @property
-    def is_trivia(self) -> bool:
-        return self.kind == "comment"
 
 
 def tokenize(src: str) -> list[Token]:
@@ -99,13 +84,16 @@ def _scan(src: str) -> Iterator[Token]:
             yield tok("comment", start, sl, sc)
             continue
 
-        # f-strings: `f"..."` / `f'...'` (lexer.c:58, TK_FSTR)
-        if c == "f" and i + 1 < n and src[i + 1] in "\"'":
-            i, col = i + 2, col + 2
-            i, line, col, closed = _string_body(src, i, line, col, src[start + 1])
+        # `"..."`, `'...'`, and the f-string prefix (lexer.c:58, TK_FSTR).
+        # Before the identifier scan, so `f"x"` is not read as the name `f`.
+        quote = c if c in "\"'" else (src[i + 1] if c == "f" and i + 1 < n and src[i + 1] in "\"'" else "")
+        if quote:
+            prefix = 1 if c == quote else 2
+            i, col = i + prefix, col + prefix
+            i, line, col, closed = _string_body(src, i, line, col, quote)
             if not closed:
                 i, line, col = _stop_at_newline(src, start, sl, sc)
-            yield tok("fstr" if closed else "error", start, sl, sc)
+            yield tok(("fstr" if prefix == 2 else "str") if closed else "error", start, sl, sc)
             continue
 
         if c.isalpha() or c == "_":
@@ -118,14 +106,6 @@ def _scan(src: str) -> Iterator[Token]:
         if c.isdigit():
             i, col, kind = _number(src, i, col)
             yield tok(kind, start, sl, sc)
-            continue
-
-        if c in "\"'":
-            i, col = i + 1, col + 1
-            i, line, col, closed = _string_body(src, i, line, col, c)
-            if not closed:
-                i, line, col = _stop_at_newline(src, start, sl, sc)
-            yield tok("str" if closed else "error", start, sl, sc)
             continue
 
         for op in OPERATORS:
@@ -203,7 +183,7 @@ def _number(src: str, i: int, col: int) -> tuple[int, int, str]:
 
 def significant(tokens: list[Token]) -> list[Token]:
     """Tokens with comments dropped -- the stream the C parser would see."""
-    return [t for t in tokens if not t.is_trivia]
+    return [t for t in tokens if t.kind != "comment"]
 
 
 def token_at(tokens: list[Token], line: int, col: int) -> Token | None:

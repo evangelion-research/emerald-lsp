@@ -36,17 +36,16 @@ def to_lsp(diag: dict, source_lines: dict[str, list[str]]) -> types.Diagnostic |
     if not isinstance(file, str) or not isinstance(line, int):
         return None
 
+    lineno = max(line - 1, 0)
     lines = source_lines.get(file)
     if lines is None:
         # multi-module runs report files that are not open; the compiler
         # already quoted the offending line for us
         quoted = diag.get("source_line")
         lines = [quoted] if isinstance(quoted, str) else []
-        lineno = 0 if lines else max(line - 1, 0)
+        text = line_text(lines, 0)
     else:
-        lineno = max(line - 1, 0)
-
-    text = line_text(lines, lineno if lines else 0)
+        text = line_text(lines, lineno)
     column = diag.get("column") if isinstance(diag.get("column"), int) else 1
     start = byte_col_to_char_col(text, column)
     end = _token_end(text, start)
@@ -60,7 +59,7 @@ def to_lsp(diag: dict, source_lines: dict[str, list[str]]) -> types.Diagnostic |
             message += f"\n  {note.get('label', 'note')}: {note.get('value', '')}"
 
     return types.Diagnostic(
-        range=range_of(max(line - 1, 0), start, max(line - 1, 0), end),
+        range=range_of(lineno, start, lineno, end),
         message=message,
         severity=_SEVERITY.get(diag.get("severity", "error"), types.DiagnosticSeverity.Error),
         code=diag.get("code"),
@@ -74,10 +73,11 @@ def _token_end(text: str, start: int) -> int:
     rendering points at a construct's first token (`docs/diagnostics.md`)."""
     if start >= len(text):
         return max(start + 1, len(text))
-    for token in tokenize(text[start:]):
-        if token.offset == 0 and token.end_line == 0:
-            return start + token.end_col
-        break
+    tokens = tokenize(text[start:])
+    # only a token beginning right at the caret and ending on the same line
+    # describes the construct; anything else falls back to a single character
+    if tokens and tokens[0].offset == 0 and tokens[0].end_line == 0:
+        return start + tokens[0].end_col
     return start + 1
 
 

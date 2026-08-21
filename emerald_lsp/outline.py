@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from lsprotocol import types
 
 from .lexer import Token, significant, tokenize
-from .positions import range_of
+from .positions import range_of, span, token_range
 
 
 @dataclass(slots=True)
@@ -99,11 +99,24 @@ def build(source: str) -> Outline:
     return _Builder(source).run()
 
 
+@dataclass(slots=True)
+class _Frame:
+    """An enclosing `def` body: where nested definitions are filed, and the
+    character range they are visible in."""
+
+    owner: Definition
+    depth: int  # brace depth the body closes at
+    scope_start: int
+    scope_end: int
+
+
 _TOPLEVEL_KIND = {
     "def": types.SymbolKind.Function,
     "type": types.SymbolKind.Interface,
     "error": types.SymbolKind.Struct,
 }
+
+_CLOSERS = {"{": "}", "(": ")", "[": "]"}
 
 
 class _Builder:
@@ -115,8 +128,7 @@ class _Builder:
         self.roots: list[Definition] = []
         self.imports: list[ImportInfo] = []
         self.folds: list[types.Range] = []
-        # (definition, brace depth it closes at) -- the enclosing def chain
-        self.stack: list[tuple[Definition, int]] = []
+        self.stack: list[_Frame] = []  # the enclosing def chain
 
     # -- token helpers ----------------------------------------------------
     def at(self, i: int) -> Token | None:
@@ -133,8 +145,7 @@ class _Builder:
     def matching(self, i: int) -> int:
         """Index of the token closing the bracket at `i`, or the last token."""
         open_tok = self.toks[i]
-        pairs = {"{": "}", "(": ")", "[": "]"}
-        close = pairs[open_tok.value]
+        close = _CLOSERS[open_tok.value]
         depth = 0
         for j in range(i, len(self.toks)):
             t = self.toks[j]
@@ -152,7 +163,7 @@ class _Builder:
     def add(self, d: Definition) -> None:
         self.defs.append(d)
         if self.stack:
-            self.stack[-1][0].children.append(d)
+            self.stack[-1].owner.children.append(d)
         else:
             self.roots.append(d)
 
@@ -169,7 +180,7 @@ class _Builder:
             if t.kind == "op" and t.value == "}":
                 depth -= 1
                 # leaving a body closes the scope anything inside it belongs to
-                while self.stack and depth < self.stack[-1][1]:
+                while self.stack and depth < self.stack[-1].depth:
                     self.stack.pop()
                 i += 1
                 continue
@@ -215,11 +226,10 @@ class _Builder:
                 return False
         return False
 
-    def scope_bounds(self, depth: int, fallback: Token) -> tuple[int, int]:
-        """A name declared at `depth` is visible to the end of its block."""
+    def scope_bounds(self) -> tuple[int, int]:
+        """A name is visible to the end of the block that encloses it."""
         if self.stack:
-            parent = self.stack[-1][0]
-            return parent.scope_start, parent.scope_end
+            return self.stack[-1].scope_start, self.stack[-1].scope_end
         return 0, len(self.source)
 
     def func(self, i: int, depth: int) -> int:
@@ -240,18 +250,14 @@ class _Builder:
 
         end_tok = self.toks[self.matching(brace)] if brace is not None else name_tok
         detail = _slice(self.source, self.toks[i], self.toks[(brace or j) - 1])
-        outer_start, outer_end = self.scope_bounds(depth, name_tok)
+        outer_start, outer_end = self.scope_bounds()
 
         d = Definition(
             name=name_tok.value,
             kind=types.SymbolKind.Function,
             detail=detail,
-            range=range_of(
-                self.toks[i].line, self.toks[i].col, end_tok.end_line, end_tok.end_col
-            ),
-            selection_range=range_of(
-                name_tok.line, name_tok.col, name_tok.end_line, name_tok.end_col
-            ),
+            range=span(self.toks[i], end_tok),
+            selection_range=token_range(name_tok),
             # a `def` is visible in the whole enclosing scope: Emerald links
             # top-level names as a set, so forward references are legal
             scope_start=outer_start,
@@ -266,17 +272,9 @@ class _Builder:
         body_start = self.toks[brace].offset
         body_end = end_tok.offset + len(end_tok.value)
         self.params(i + 2, brace, body_start, body_end)
-        self.stack.append(
-            (
-                Definition(
-                    d.name, d.kind, d.detail, d.range, d.selection_range,
-                    body_start, body_end, d.exported, d.children,
-                ),
-                depth + 1,
-            )
-        )
-        # the pushed frame carries the *body* scope for anything declared inside
-        self.stack[-1][0].children = d.children
+        # `d` keeps the whole construct's scope; the frame carries the *body*
+        # scope, which is what anything declared inside is visible in
+        self.stack.append(_Frame(d, depth + 1, body_start, body_end))
         return i + 2
 
     def params(self, start: int, brace: int, scope_start: int, scope_end: int) -> None:
@@ -295,18 +293,14 @@ class _Builder:
                 depth += 1
             elif t.kind == "op" and t.value in ")]}":
                 depth -= 1
-            elif (
-                depth == 1
-                and t.kind == "ident"
-                and (self.is_op(j - 1, "(", ",") )
-            ):
+            elif depth == 1 and t.kind == "ident" and self.is_op(j - 1, "(", ","):
                 self.defs.append(
                     Definition(
                         name=t.value,
                         kind=types.SymbolKind.Variable,
                         detail=_param_detail(self.source, self.toks, j, close),
-                        range=range_of(t.line, t.col, t.end_line, t.end_col),
-                        selection_range=range_of(t.line, t.col, t.end_line, t.end_col),
+                        range=token_range(t),
+                        selection_range=token_range(t),
                         scope_start=scope_start,
                         scope_end=scope_end,
                         exported=False,
@@ -326,18 +320,14 @@ class _Builder:
                 j += 1
         elif self.is_op(i + 2, "{"):
             end = self.toks[self.matching(i + 2)]
-        start, stop = self.scope_bounds(depth, name_tok)
+        start, stop = self.scope_bounds()
         self.add(
             Definition(
                 name=name_tok.value,
                 kind=_TOPLEVEL_KIND[keyword],
                 detail=_slice(self.source, self.toks[i], end),
-                range=range_of(
-                    self.toks[i].line, self.toks[i].col, end.end_line, end.end_col
-                ),
-                selection_range=range_of(
-                    name_tok.line, name_tok.col, name_tok.end_line, name_tok.end_col
-                ),
+                range=span(self.toks[i], end),
+                selection_range=token_range(name_tok),
                 scope_start=start,
                 scope_end=stop,
                 exported=depth == 0 and not name_tok.value.startswith("_"),
@@ -347,7 +337,7 @@ class _Builder:
 
     def dims(self, i: int, depth: int) -> int:
         """`dim Batch, Seq` -- nominally distinct dimension names."""
-        start, stop = self.scope_bounds(depth, self.toks[i])
+        start, stop = self.scope_bounds()
         j = i + 1
         while j < len(self.toks):
             t = self.toks[j]
@@ -358,8 +348,8 @@ class _Builder:
                     name=t.value,
                     kind=types.SymbolKind.TypeParameter,
                     detail=f"dim {t.value}",
-                    range=range_of(t.line, t.col, t.end_line, t.end_col),
-                    selection_range=range_of(t.line, t.col, t.end_line, t.end_col),
+                    range=token_range(t),
+                    selection_range=token_range(t),
                     scope_start=start,
                     scope_end=stop,
                     exported=depth == 0 and not t.value.startswith("_"),
@@ -381,17 +371,15 @@ class _Builder:
                 break
             end = self.toks[j]
             j += 1
-        start, stop = self.scope_bounds(depth, name_tok)
+        start, stop = self.scope_bounds()
         # a binding is visible from its own declaration onward, not before
         self.add(
             Definition(
                 name=name_tok.value,
                 kind=types.SymbolKind.Constant if const else types.SymbolKind.Variable,
                 detail=_slice(self.source, self.toks[i - 1] if const else name_tok, end),
-                range=range_of(name_tok.line, name_tok.col, end.end_line, end.end_col),
-                selection_range=range_of(
-                    name_tok.line, name_tok.col, name_tok.end_line, name_tok.end_col
-                ),
+                range=span(name_tok, end),
+                selection_range=token_range(name_tok),
                 scope_start=name_tok.offset,
                 scope_end=stop,
                 exported=depth == 0 and not name_tok.value.startswith("_"),
@@ -416,9 +404,7 @@ class _Builder:
             return i + 1
 
         module_path = ".".join(p.value for p in parts)
-        module_range = range_of(
-            parts[0].line, parts[0].col, parts[-1].end_line, parts[-1].end_col
-        )
+        module_range = span(parts[0], parts[-1])
         alias: str | None = None
         names: list[ImportedName] = []
         end = parts[-1]
@@ -438,7 +424,7 @@ class _Builder:
                         na, end, j = a.value, a, j + 2
                     names.append(
                         ImportedName(
-                            nm, na, range_of(t.line, t.col, t.end_line, t.end_col)
+                            nm, na, token_range(t)
                         )
                     )
                     if not self.is_op(j, ","):
@@ -451,7 +437,7 @@ class _Builder:
             module_range=module_range,
             alias=alias,
             names=names,
-            range=range_of(kw.line, kw.col, end.end_line, end.end_col),
+            range=span(kw, end),
         )
         self.imports.append(info)
 

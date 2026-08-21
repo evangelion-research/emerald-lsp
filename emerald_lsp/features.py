@@ -22,7 +22,7 @@ from . import modules
 from .language import BUILTINS, CONSTANTS, KEYWORDS, TYPE_ATOMS, describe
 from .lexer import Token, significant, token_at
 from .outline import Definition, ImportInfo, Outline
-from .positions import path_to_uri, token_range
+from .positions import contains, path_to_uri, range_of, token_range
 
 
 @dataclass(slots=True)
@@ -34,6 +34,10 @@ class Context:
     outline: Outline
     include_paths: list[str]
     compiler: str | None
+
+    def line(self, number: int) -> str:
+        lines = self.source.splitlines()
+        return lines[number] if 0 <= number < len(lines) else ""
 
     def offset_at(self, position: types.Position) -> int:
         offset = 0
@@ -120,16 +124,12 @@ def _describe_token(ctx: Context, token: Token, position: types.Position) -> str
     name = token.value
 
     for info in ctx.outline.imports:
-        if _in_range(info.module_range, position):
-            resolved = ctx.resolve_module(info.module_path)
-            where = resolved.path if resolved else "*unresolved*"
-            return f"**module `{info.module_path}`**\n\n{where}"
+        if contains(info.module_range, position):
+            return _module_markdown(ctx, info.module_path)
 
     binding = ctx.module_bindings().get(name)
     if binding is not None and token.kind == "ident":
-        resolved = ctx.resolve_module(binding.module_path)
-        where = resolved.path if resolved else "*unresolved*"
-        return f"**module `{binding.module_path}`**\n\n{where}"
+        return _module_markdown(ctx, binding.module_path)
 
     local = ctx.outline.resolve(name, ctx.offset_at(position))
     if local is not None:
@@ -147,11 +147,11 @@ def _describe_token(ctx: Context, token: Token, position: types.Position) -> str
     return describe(name)
 
 
-def _in_range(rng: types.Range, position: types.Position) -> bool:
-    return (rng.start.line, rng.start.character) <= (
-        position.line,
-        position.character,
-    ) <= (rng.end.line, rng.end.character)
+def _module_markdown(ctx: Context, module_path: str) -> str:
+    """Hover for a module path: where it resolves to, or that it does not."""
+    found = _module_file(ctx, module_path)
+    where = found[0] if found else "*unresolved*"
+    return f"**module `{module_path}`**\n\n{where}"
 
 
 def _qualified_base(ctx: Context, token: Token) -> str | None:
@@ -164,12 +164,19 @@ def _qualified_base(ctx: Context, token: Token) -> str | None:
     return None
 
 
-def _module_exports(ctx: Context, module_path: str) -> list[Definition]:
+def _module_file(ctx: Context, module_path: str) -> tuple[str, list[Definition]] | None:
+    """The file a module path resolves to and what it exports, or None if the
+    path does not resolve under any search root."""
     resolved = ctx.resolve_module(module_path)
     if resolved is None:
-        return []
+        return None
     other = modules.read_outline(resolved.path)
-    return other.exports() if other else []
+    return resolved.path, (other.exports() if other else [])
+
+
+def _module_exports(ctx: Context, module_path: str) -> list[Definition]:
+    found = _module_file(ctx, module_path)
+    return found[1] if found else []
 
 
 # -- goto definition -----------------------------------------------------
@@ -182,13 +189,13 @@ def definition(ctx: Context, position: types.Position) -> list[types.Location]:
 
     # on the module path of an import: jump to the module's file
     for info in ctx.outline.imports:
-        if _in_range(info.module_range, position):
+        if contains(info.module_range, position):
             return _module_location(ctx, info.module_path)
         for name in info.names:
-            if _in_range(name.range, position):
-                return _exported_location(ctx, info.module_path, name.name) or (
-                    _module_location(ctx, info.module_path)
-                )
+            if contains(name.range, position):
+                return _exported_location(
+                    ctx, info.module_path, name.name
+                ) or _module_location(ctx, info.module_path)
 
     binding = ctx.module_bindings().get(token.value)
     if binding is not None:
@@ -210,38 +217,32 @@ def definition(ctx: Context, position: types.Position) -> list[types.Location]:
     for info in ctx.outline.imports:
         for name in info.names:
             if name.local == token.value:
-                return _exported_location(ctx, info.module_path, name.name) or []
+                return _exported_location(ctx, info.module_path, name.name)
     return []
 
 
 def _module_location(ctx: Context, module_path: str) -> list[types.Location]:
-    resolved = ctx.resolve_module(module_path)
-    if resolved is None:
+    """The top of a module's file."""
+    found = _module_file(ctx, module_path)
+    if found is None:
         return []
-    zero = types.Range(
-        start=types.Position(line=0, character=0),
-        end=types.Position(line=0, character=0),
-    )
-    return [types.Location(uri=path_to_uri(resolved.path), range=zero)]
+    return [types.Location(uri=path_to_uri(found[0]), range=range_of(0, 0, 0, 0))]
 
 
 def _exported_location(
     ctx: Context, module_path: str, name: str
-) -> list[types.Location] | None:
-    resolved = ctx.resolve_module(module_path)
-    if resolved is None:
-        return None
-    other = modules.read_outline(resolved.path)
-    if other is None:
-        return None
-    for d in other.exports():
-        if d.name == name:
-            return [
-                types.Location(
-                    uri=path_to_uri(resolved.path), range=d.selection_range
-                )
-            ]
-    return None
+) -> list[types.Location]:
+    """Where a module defines the name it exports -- empty if either the
+    module or the name does not resolve."""
+    found = _module_file(ctx, module_path)
+    if found is None:
+        return []
+    path, exports = found
+    return [
+        types.Location(uri=path_to_uri(path), range=d.selection_range)
+        for d in exports
+        if d.name == name
+    ][:1]
 
 
 # -- references and highlights (this file only) --------------------------
@@ -279,7 +280,7 @@ def highlights(ctx: Context, position: types.Position) -> list[types.DocumentHig
 
 
 def completions(ctx: Context, position: types.Position) -> types.CompletionList:
-    line = _line_text(ctx.source, position.line)[: position.character]
+    line = ctx.line(position.line)[: position.character]
     stripped = line.strip()
     words = stripped.split()
 
@@ -303,11 +304,6 @@ def completions(ctx: Context, position: types.Position) -> types.CompletionList:
         return _export_completions(ctx, info.module_path)
 
     return types.CompletionList(is_incomplete=False, items=_scope_completions(ctx, position))
-
-
-def _line_text(source: str, line: int) -> str:
-    lines = source.splitlines()
-    return lines[line] if 0 <= line < len(lines) else ""
 
 
 def _dotted_base(prefix: str) -> str | None:

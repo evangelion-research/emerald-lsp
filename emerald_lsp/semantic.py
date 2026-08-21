@@ -15,7 +15,7 @@ from __future__ import annotations
 from lsprotocol import types
 
 from .language import BUILTINS, CONSTANTS, TYPE_ATOMS
-from .lexer import Token
+from .lexer import Token, significant
 
 TOKEN_TYPES = [
     "namespace",
@@ -40,7 +40,6 @@ _TYPE_INDEX = {name: i for i, name in enumerate(TOKEN_TYPES)}
 _MOD_BIT = {name: 1 << i for i, name in enumerate(TOKEN_MODIFIERS)}
 
 _SIMPLE = {
-    "comment": "comment",
     "str": "string",
     "fstr": "string",
     "int": "number",
@@ -69,19 +68,22 @@ def classify(
 ) -> list[tuple[int, int, int, int, int]]:
     """(line, col, length, type index, modifier bits) per highlighted token."""
     out: list[tuple[int, int, int, int, int]] = []
-    sig = [t for t in tokens if t.kind != "comment"]
-    sig_index = {id(t): i for i, t in enumerate(sig)}
+    sig = significant(tokens)
+    i = -1  # index of `token` within `sig`, tracked as we go
 
     for token in tokens:
+        if token.kind == "comment":
+            out.extend(_spans(token, lines, _TYPE_INDEX["comment"], 0))
+            continue
+        i += 1
         if token.kind == "error":
             continue
-        i = sig_index.get(id(token), -1)
         kind, mods = _kind_of(token, sig, i, modules)
         if kind is None:
             continue
-        type_index = _TYPE_INDEX[kind]
-        bits = sum(_MOD_BIT[m] for m in mods)
-        out.extend(_spans(token, lines, type_index, bits))
+        out.extend(
+            _spans(token, lines, _TYPE_INDEX[kind], sum(_MOD_BIT[m] for m in mods))
+        )
     return out
 
 
