@@ -36,6 +36,8 @@ class Definition:
     scope_end: int
     exported: bool  # module.c:235 -- a leading underscore means private
     children: list["Definition"] = field(default_factory=list)
+    is_parameter: bool = False
+    is_import: bool = False
 
 
 @dataclass(slots=True)
@@ -304,6 +306,7 @@ class _Builder:
                         scope_start=scope_start,
                         scope_end=scope_end,
                         exported=False,
+                        is_parameter=True,
                     )
                 )
             j += 1
@@ -462,6 +465,7 @@ class _Builder:
                     scope_start=0,
                     scope_end=len(self.source),
                     exported=False,  # an import binding is not re-exported
+                    is_import=True,
                 )
             )
         return j

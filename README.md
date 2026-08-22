@@ -18,7 +18,7 @@ protocol lifecycle today, in two layers with very different reach:
 
 | Feature | How it works | Limit |
 |---|---|---|
-| Diagnostics | `emeraldc --check --json` per document version, debounced | one syntax error at a time, until the parser recovers (§1a); ranges are one token wide, until the AST carries end positions (§1b) |
+| Diagnostics | local unused-code analysis plus `emeraldc --check --json` per document version, debounced | Go-style unused imports and local bindings are reported as errors; type checking still needs `emeraldc`, and it reports one syntax error at a time until the parser recovers (§1a) |
 | Semantic tokens | this package's own Emerald lexer | purely lexical, and deliberately so — it survives a broken import graph |
 | Document symbols, folding | a token-level outline | no types |
 | Hover | declaration text, or the builtin/keyword table | shows the *declaration*, not an inferred type (§4b) |
@@ -49,10 +49,10 @@ uv sync
 uv run emerald-lsp --help
 ```
 
-The server needs `emeraldc` on `PATH` for diagnostics — set
+The server needs `emeraldc` on `PATH` for compiler diagnostics — set
 `emerald.compilerPath` or `$EMERALDC` if it lives elsewhere. Without it,
-every syntax-only feature above still works; the server says so once and
-carries on.
+syntax features and unused-code diagnostics still work; the server says so
+once and carries on.
 
 To see the exact query the server makes per keystroke:
 

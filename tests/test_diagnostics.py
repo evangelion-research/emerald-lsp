@@ -1,6 +1,7 @@
 from lsprotocol import types
 
-from emlsp.diagnostics import group_by_uri, to_lsp
+from emlsp.diagnostics import group_by_uri, to_lsp, unused_diagnostics
+from emlsp.outline import build
 
 DIAG = {
     "kind": "type",
@@ -71,3 +72,42 @@ def test_stdlib_diagnostics_have_no_uri_and_are_dropped():
 
 def test_malformed_input_is_ignored():
     assert to_lsp({"message": "no location"}, {}) is None
+
+
+def test_unused_imports_and_local_bindings_are_errors():
+    source = """\
+import unused
+import used
+const TOP_LEVEL = 1
+
+def f(argument) {
+    dead = 1
+    live = used
+    print(live)
+}
+"""
+    found = unused_diagnostics(build(source))
+    assert [(d.code, d.message) for d in found] == [
+        ("E_UNUSED", 'imported and not used: "unused"'),
+        ("E_UNUSED", "declared and not used: dead"),
+    ]
+    assert found[0].severity == types.DiagnosticSeverity.Error
+    assert found[0].range.start == types.Position(line=0, character=7)
+    assert found[1].range.start == types.Position(line=5, character=4)
+
+
+def test_unused_analysis_exempts_parameters_and_top_level_api():
+    source = """\
+const API_VALUE = 1
+
+def public(argument) {
+    return 1
+}
+"""
+    assert unused_diagnostics(build(source)) == []
+
+
+def test_unused_alias_points_at_the_local_alias():
+    found = unused_diagnostics(build("from result import Err as Failure\n"))
+    assert found[0].message == 'imported and not used: "Failure"'
+    assert found[0].range.start.character == len("from result import Err as ")

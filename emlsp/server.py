@@ -71,7 +71,8 @@ class EmeraldLanguageServer(LanguageServer):
             types.ShowMessageParams(
                 type=types.MessageType.Warning,
                 message=f"{SERVER_NAME}: {message}. "
-                "Syntax features stay available; diagnostics need emeraldc.",
+                "Syntax features and unused-code diagnostics stay available; "
+                "compiler diagnostics need emeraldc.",
             )
         )
 
@@ -114,14 +115,18 @@ class EmeraldLanguageServer(LanguageServer):
         path = uri_to_path(uri)
         if path is None:
             return
+
+        doc = self.workspace.get_text_document(uri)
+        source = doc.source
+        local = diagnostics.unused_diagnostics(build(source))
+
         if self.compiler_path is None:
             self.locate_compiler()
         if self.compiler_path is None:
             self.warn_once(self.compiler_error or "emeraldc not found")
+            self._publish({uri: local})
             return
 
-        doc = self.workspace.get_text_document(uri)
-        source = doc.source
         on_disk = _read(path)
         result = await asyncio.to_thread(
             compiler.check,
@@ -132,10 +137,15 @@ class EmeraldLanguageServer(LanguageServer):
         )
         if not result.ok:
             self.warn_once(result.detail)
+            self._publish({uri: local})
             return
 
         grouped = diagnostics.group_by_uri(result.diagnostics, {path: source.splitlines()})
-        grouped.setdefault(uri, [])
+        grouped.setdefault(uri, []).extend(local)
+        self._publish(grouped)
+
+    def _publish(self, grouped: dict[str, list[types.Diagnostic]]) -> None:
+        """Publish compiler and local diagnostics, clearing stale files."""
         for stale in self._published - grouped.keys():
             self.text_document_publish_diagnostics(
                 types.PublishDiagnosticsParams(uri=stale, diagnostics=[])

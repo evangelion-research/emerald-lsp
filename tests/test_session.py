@@ -93,6 +93,20 @@ def test_diagnostics_are_published_for_an_open_document(session, main):
         assert params["diagnostics"][0]["source"] == "emeraldc"
 
 
+def test_unused_diagnostics_work_without_a_compiler(session, workspace):
+    path = workspace / "unused.rald"
+    path.write_text("import strings\n\ndef main() {\n    value = 1\n}\n")
+    with session() as client:
+        client.open(path)
+        params = client.wait_for("textDocument/publishDiagnostics")
+        assert [d["code"] for d in params["diagnostics"]] == ["E_UNUSED", "E_UNUSED"]
+        assert [d["message"] for d in params["diagnostics"]] == [
+            'imported and not used: "strings"',
+            "declared and not used: value",
+        ]
+        assert all(d["severity"] == 1 for d in params["diagnostics"])
+
+
 def test_editing_re_checks_the_unsaved_buffer(session, main, workspace):
     with session(with_compiler=True) as client:
         uri = client.open(main)
